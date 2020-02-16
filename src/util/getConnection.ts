@@ -1,5 +1,5 @@
 import { createConnection, getConnection as _getConnection, EntitySchema, ConnectionOptions } from 'typeorm';
-import {logger} from "./PinoLogger";
+import { logger } from './PinoLogger';
 
 export const getConnection = async (
   entities: (Function | string | EntitySchema<any>)[],

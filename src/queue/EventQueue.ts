@@ -1,15 +1,15 @@
 import * as Queue from 'bull';
 import * as Rx from 'rxjs/operators';
-import { BaseEvent } from '../Event';
 import { Observable, Subject } from 'rxjs';
 import { Job } from 'bull';
 import * as R from 'ramda';
-import {logger} from "../util/PinoLogger";
+import { logger } from '../util/PinoLogger';
+import { BaseEvent } from '../EventStore.types';
 
 const createEventQueueProcessObservable = (
-  queue: Queue.Queue<BaseEvent<any>>
-): Observable<{ job: Queue.Job<BaseEvent<any>>; done: Queue.DoneCallback }> =>
-  new Observable<{ job: Queue.Job<BaseEvent<any>>; done: Queue.DoneCallback }>(observer => {
+  queue: Queue.Queue<BaseEvent>
+): Observable<{ job: Queue.Job<BaseEvent>; done: Queue.DoneCallback }> =>
+  new Observable<{ job: Queue.Job<BaseEvent>; done: Queue.DoneCallback }>(observer => {
     queue.process((job, done) => {
       observer.next({ job, done });
     });

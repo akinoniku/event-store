@@ -3,40 +3,25 @@ import { Connection, ConnectionOptions } from 'typeorm';
 import { registerEventFlowTypes } from './EventFlow.register';
 import * as uuid from 'uuid/v4';
 import * as R from 'ramda';
-import { EventQueue, EventQueueType } from './queue/EventQueue';
+import { EventQueue } from './queue/EventQueue';
 import { logEvent } from './util/logEvent';
 import * as Rx from 'rxjs/operators';
-import { Observable, OperatorFunction, of, zip } from 'rxjs';
+import { Observable, of, OperatorFunction, zip } from 'rxjs';
 import { validateEvent } from './EventOperators/validateEvent.operator';
-import { getConsequentEvent } from './EventOperators/getConsequentEvent.opeartor';
-import { BaseEvent, CreateEventInput } from './Event';
+import { getConsequentEventInputs } from './EventOperators/getConsequentEvent.opeartor';
 import { EventStoreRepo } from './EventStore.repo';
-import {logger} from "./util/PinoLogger";
+import { logger } from './util/PinoLogger';
+import { BaseEvent, CreatedEvent, EventArgs, EventFlow, EventPayloadInput } from './EventStore.types';
 
 export interface EventFlowMap {
-  [key: string]: EventFlow<any, any, any>;
+  [key: string]: EventFlow<any, any, any, any>;
 }
 
-export interface EventFlow<Domain, Action, Payload> {
-  domain: Domain;
-  action: Action;
-  createEvent: (createEventInput: CreateEventInput<Payload>) => Promise<BaseEvent<Payload>>;
-  createConsequentEvents?: (causalEvent: BaseEvent<Payload>) => Promise<BaseEvent<any>[]>;
-  validate: (event: BaseEvent<Payload>) => Promise<boolean>;
-  process: (event: BaseEvent<Payload>) => Promise<boolean>;
-  processCancel?: (event: BaseEvent<Payload>) => Promise<boolean>;
-  sideEffect?: (event: BaseEvent<Payload>) => Promise<void>;
-}
+const getEventKey = (event: EventPayloadInput<any, any, any>) => event.domain + '__' + event.type;
 
-const getEventKey = (event: BaseEvent<any>) => event.domain + '__' + event.action;
-
-const getEventFlowOld = (eventFlowMap: EventFlowMap, event: BaseEvent<any>) => {
-  const key = getEventKey(event);
-  const eventFlow = eventFlowMap[key];
-  if (!eventFlow) {
-    throw new Error(`Event Flow (${key}) not found`);
-  }
-  return eventFlow;
+const getEventFlow = (eventFlowMap: EventFlowMap, eventPayloadArgs: EventPayloadInput<any, any, any>) => {
+  const key = getEventKey(eventPayloadArgs);
+  return eventFlowMap[key];
 };
 
 const applyEvent = (
@@ -46,18 +31,31 @@ const applyEvent = (
   $input.pipe(
     Rx.mergeMap((job: Job<BaseEvent>) => {
       const event = job.data;
-      const EventFlow = getEventFlowOld(eventFlowMap, event);
+      const EventFlow = getEventFlow(eventFlowMap, event);
       return of([EventFlow, event]).pipe(
         validateEvent,
         Rx.mergeMap(async ({ event, EventFlow }) => {
           logEvent(event, '🉑️️', 'Apply');
-          await EventFlow.process(event);
+          if (EventFlow.executor) {
+            await EventFlow.executor(event);
+          }
           return { EventFlow, event };
         }),
-        getConsequentEvent,
-        Rx.flatMap(async ({ consequentEvents, event }) => {
-          await consequentEvents.reduce<Promise<any>>(async (acc, currentEvent) => {
+        getConsequentEventInputs,
+        Rx.flatMap(async ({ consequentEventPayloadInputs, event }) => {
+          await consequentEventPayloadInputs.reduce<Promise<any>>(async (acc, currentEventPayloadInput) => {
             if (acc) await acc;
+            const eventFlow = getEventFlow(eventFlowMap, currentEventPayloadInput);
+            const payload = eventFlow.eventPayloadCreator
+              ? await eventFlow.eventPayloadCreator(currentEventPayloadInput)
+              : currentEventPayloadInput.input;
+            const currentEvent = defaultEventCreator(
+              {
+                ...currentEventPayloadInput,
+                payload
+              },
+              event
+            );
             await applyQueue.add(currentEvent);
           }, null);
           return event;
@@ -70,13 +68,29 @@ const applyEvent = (
     })
   );
 
+export function defaultEventCreator<Domain, Type, Input, Payload>(
+  eventArgs: EventArgs<Domain, Type, Input, Payload>,
+  causalEvent?: CreatedEvent<any, any, any, any>
+): CreatedEvent<Domain, Type, Input, Payload> {
+  return {
+    ...eventArgs,
+
+    trackingId: eventArgs.trackingId || uuid(),
+    causationId: eventArgs.causationId || causalEvent ? causalEvent.trackingId : undefined,
+    correlationId:
+      eventArgs.correlationId || causalEvent ? causalEvent.correlationId || causalEvent.trackingId : undefined,
+
+    created: new Date()
+  };
+}
+
 export class EventStoreService {
   private readonly eventFlowMap: EventFlowMap;
   private readonly eventQueue: EventQueue;
   private readonly eventStoreRepo: EventStoreRepo;
 
   constructor(
-    private eventFlows: EventFlow<any, any, any>[],
+    private eventFlows: EventFlow<any, any, any, any>[],
     private connectionOptions: ConnectionOptions,
     private redisConnectString: string,
     private readonly name = 'default'
@@ -115,12 +129,12 @@ export class EventStoreService {
           const isLastOneError = lastOne instanceof Error;
           if (isLastOneError) {
             // roll backing
-            const events = R.slice(0, -1)(eventsAndMaybeError) as BaseEvent[];
+            const events = R.filter(current => !(current instanceof Error))(eventsAndMaybeError) as BaseEvent[];
             await events.reduce<Promise<any>>(async (acc, currentEvent) => {
               if (acc) await acc;
-              const EventFlow = getEventFlowOld(this.eventFlowMap, currentEvent);
+              const EventFlow = getEventFlow(this.eventFlowMap, currentEvent);
               logEvent(currentEvent, '❌', 'cancel');
-              EventFlow.processCancel && (await EventFlow.processCancel(currentEvent));
+              EventFlow.executorCanceler && (await EventFlow.executorCanceler(currentEvent));
             }, null);
           } else {
             const events = eventsAndMaybeError as BaseEvent[];
@@ -134,13 +148,20 @@ export class EventStoreService {
       .subscribe();
   }
 
-  async receiveEvent(event: BaseEvent<any>): Promise<BaseEvent<any>> {
-    logEvent(event, '📩', 'receive');
+  async receiveEventInput(eventPayloadArgs: EventPayloadInput<any, any, any>): Promise<BaseEvent> {
+    const eventFlow = getEventFlow(this.eventFlowMap, eventPayloadArgs);
 
+    if (!eventFlow) {
+      logger.warn(`${eventPayloadArgs.domain}|${eventPayloadArgs.type} is not known event.`);
+    }
+
+    const payload = eventFlow.eventPayloadCreator
+      ? await eventFlow.eventPayloadCreator(eventPayloadArgs)
+      : eventPayloadArgs.input;
+    const eventArgs = { ...eventPayloadArgs, payload };
+    const event = defaultEventCreator<any, any, any, any>(eventArgs);
     const job = await this.eventQueue.waitQueue.add(event);
-
     await job.finished();
-
     return event;
   }
 
@@ -153,10 +174,10 @@ export class EventStoreService {
         logger.info(`page, ${page}. replaying ${events.length}`);
         await events.reduce<Promise<any>>(async (acc, currentEvent) => {
           if (acc) await acc;
-          const EventFlow = getEventFlowOld(this.eventFlowMap, currentEvent);
+          const EventFlow = getEventFlow(this.eventFlowMap, currentEvent);
           currentEvent.payload = JSON.parse(currentEvent.payload);
           logEvent(currentEvent, '🉑️️', 'Apply');
-          const result = await EventFlow.process(currentEvent);
+          const result = await EventFlow.executor(currentEvent);
         }, null);
         page++;
       } else {

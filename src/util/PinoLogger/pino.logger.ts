@@ -1,7 +1,5 @@
 // http://getpino.io/#/
 
-import * as pino from "pino";
+import * as pino from 'pino';
 
-export const logger = pino({
-  prettyPrint: true
-});
+export const logger = pino();

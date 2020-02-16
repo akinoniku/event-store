@@ -1,8 +1,8 @@
 import { Connection, Repository } from 'typeorm';
 import { EventStoreEntity } from './EventStore.entity';
 import { ConnectionOptions } from 'typeorm';
-import { BaseEvent } from './Event';
-import {getConnection} from "./util/getConnection";
+import { getConnection } from './util/getConnection';
+import { BaseEvent } from './EventStore.types';
 
 export class EventStoreRepo {
   public repo: Repository<EventStoreEntity>;
@@ -30,25 +30,27 @@ export class EventStoreRepo {
     });
   }
 
-  storeEvent = async <T>(event: BaseEvent<T>) => {
+  storeEvent = async (event: BaseEvent) => {
     await this.init();
     const newEventEntity = new EventStoreEntity();
-    const { refId, domain, action, payload, correlationId, causationId } = event;
+    const { trackingId, domain, type, payload, input, created, correlationId, causationId } = event;
 
     Object.assign(newEventEntity, {
-      refId,
+      trackingId,
       domain,
-      action,
+      type,
       correlationId,
-      causationId
+      causationId,
+      created
     });
 
     newEventEntity.payload = JSON.stringify(payload);
+    newEventEntity.input = JSON.stringify(input);
 
     await this.repo.save(newEventEntity);
   };
 
-  storeEvents = async <T>(events: BaseEvent<T>[]) => {
+  storeEvents = async (events: BaseEvent[]) => {
     await this.init();
     // TODO transaction
     await Promise.all(events.map(this.storeEvent.bind(this)));

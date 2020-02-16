@@ -9,13 +9,16 @@ export class EventStoreEntity {
   domain: string;
 
   @Column('varchar', { length: 15 })
-  action: string;
+  type: string;
+
+  @Column('text')
+  input: string;
 
   @Column('text')
   payload: string;
 
   @Column('varchar', { length: 36 })
-  refId: string; //uuid
+  trackingId: string; //uuid
 
   @Column('varchar', { nullable: true, length: 36 })
   correlationId: string; //uuid
@@ -23,6 +26,6 @@ export class EventStoreEntity {
   @Column('varchar', { nullable: true, length: 36 })
   causationId: string; //uuid
 
-  @CreateDateColumn()
+  @Column()
   readonly created: Date;
 }
